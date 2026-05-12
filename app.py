@@ -100,21 +100,30 @@ if not st.session_state.logged_in:
 st_autorefresh(interval=300000)
 
 # ----------------------------------
-# 💾 PERSIST EMAIL LIST TO DISK
+# 💾 PERSIST CC MAP TO DISK
 # ----------------------------------
 CC_FILE = "cc_list.json"
 
 def load_cc():
+    """Load cc_author_map from disk. Returns dict {email: display_name}."""
     try:
         with open(CC_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
+            if not data:
+                return {}
+            if isinstance(data[0], list):
+                return dict(data)
+            if isinstance(data[0], str):
+                return {e: "" for e in data}
+            return {}
     except:
-        return []
+        return {}
 
-def save_cc(emails):
+def save_cc(cc_map: dict):
+    """Save cc_author_map to disk as list of [email, name] pairs."""
     try:
         with open(CC_FILE, "w") as f:
-            json.dump(emails, f)
+            json.dump(list(cc_map.items()), f)
     except:
         pass
 
@@ -210,23 +219,17 @@ def get_testrail(run_id):
             "DefectID":      r.get("defects", ""),
             "ExecutionDate": exec_date,
             "RunID":         run_id,
-            "created_on":    r.get("created_on", 0),  # keep for dedup sort
+            "created_on":    r.get("created_on", 0),
         })
 
     if not rows:
         return pd.DataFrame()
 
     raw_df = pd.DataFrame(rows)
-
-    # ✅ KEY FIX: Keep only the LATEST result per test_id to match TestRail UI counts.
-    # get_results_for_run returns ALL historical result entries; without dedup,
-    # re-tested cases are counted multiple times inflating/deflating each status bucket.
     raw_df = raw_df.sort_values("created_on", ascending=False)
     raw_df = raw_df.drop_duplicates(subset=["TestCaseID"], keep="first")
-
-    # Now filter to only the statuses we care about
-    final = raw_df[raw_df["Status"].isin(allowed)].copy()
-    final = final.drop(columns=["created_on"])
+    final  = raw_df[raw_df["Status"].isin(allowed)].copy()
+    final  = final.drop(columns=["created_on"])
     return final
 
 @st.cache_data(ttl=1800)
@@ -291,11 +294,28 @@ def get_jira(linked_bugs=()):
             break
     return pd.DataFrame(issues) if issues else pd.DataFrame()
 
+
 # ----------------------------------
-# 🔹 GET LATEST COMMENT
+# 🔹 GET LATEST COMMENT + @MENTIONS
 # ----------------------------------
 @st.cache_data(ttl=600)
 def get_single_comment(bug_id: str):
+    """
+    Fetches the latest Jira comment and extracts @mentions in all formats:
+
+      ADF (Atlassian Document Format):
+        - 'mention' nodes carry the display name in attrs.text
+          e.g. {"type":"mention","attrs":{"text":"Keerthan Kumar K",...}}
+
+      Plain text / Wiki markup:
+        - @email@domain.com  → captured as full email in MentionEmails
+        - [~username]        → captured as display name in Mentions
+        - @FirstName         → captured as display name in Mentions (emails excluded)
+
+    Returns dict keys:
+      Mentions       – list of display names / wiki usernames
+      MentionEmails  – list of full email strings found via @email pattern
+    """
     domain = st.secrets["jira_domain"].strip().rstrip("/")
     if not domain.startswith("http"):
         domain = f"https://{domain}"
@@ -310,31 +330,150 @@ def get_single_comment(bug_id: str):
         data = res.json()
         if not data.get("comments"):
             return None
+
         last = data["comments"][-1]
         body = last.get("body", "")
-        try:
-            txt = (
-                body["content"][0]["content"][0]["text"]
-                if isinstance(body, dict) else str(body).strip() or "No Comment"
-            )
-        except:
-            txt = "No Comment"
+
+        mentioned_names  = []   # display names from ADF / wiki / plain @Name
+        mentioned_emails = []   # full emails like keerthan.kumar@hp.com
+        txt = "No Comment"
+
+        if isinstance(body, dict):
+            # ── Atlassian Document Format (ADF) ──
+            plain_parts = []
+
+            def walk(node):
+                if not isinstance(node, dict):
+                    return
+                ntype = node.get("type", "")
+                if ntype == "mention":
+                    # attrs.text contains the display name, e.g. "Keerthan Kumar K"
+                    name = node.get("attrs", {}).get("text", "").lstrip("@").strip()
+                    if name and name not in mentioned_names:
+                        mentioned_names.append(name)
+                elif ntype == "text":
+                    plain_parts.append(node.get("text", ""))
+                for child in node.get("content", []):
+                    walk(child)
+
+            walk(body)
+            txt = " ".join(plain_parts).strip() or "No Comment"
+
+        else:
+            # ── Plain text / Wiki markup ──
+            txt = str(body).strip() or "No Comment"
+
+            # Pattern 1: @word@domain.com — full email mention
+            for em in re.findall(r"@([\w.+-]+@[\w.-]+\.[a-zA-Z]{2,})", txt):
+                if em not in mentioned_emails:
+                    mentioned_emails.append(em)
+
+            # Pattern 2: [~username] or [~accountid:xxx] — Jira wiki mention
+            for wm in re.findall(r"\[~(?:accountid:)?([^\]]+)\]", txt):
+                if wm not in mentioned_names:
+                    mentioned_names.append(wm)
+
+            # Pattern 3: plain @Word — exclude anything that is or leads to an email
+            clean_txt = re.sub(r"@[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", "", txt)
+            for pm in re.findall(r"@([A-Za-z][A-Za-z0-9_]*(?:\s[A-Za-z][A-Za-z0-9_]*)*)", clean_txt):
+                pm = pm.strip()
+                if pm and pm not in mentioned_names:
+                    mentioned_names.append(pm)
+
         dt = datetime.strptime(last["created"][:10], "%Y-%m-%d")
         return {
             "BugID":           bug_id,
             "LatestComment":   txt,
             "Author":          last["author"]["displayName"],
+            "Mentions":        mentioned_names,
+            "MentionEmails":   mentioned_emails,
             "CommentDateDisp": dt.strftime("%d %b %Y"),
-            "CommentID":       last.get("id", "")
+            "CommentID":       last.get("id", ""),
         }
     except:
         return None
+
+def resolve_mention_to_emails(mentions, mention_emails, cc_author_map):
+    """
+    KEY FIX: Jira strips the leading @ so full emails like
+    'keerthan.kumar-k@hp.com' land in `mentions` (display names)
+    instead of `mention_emails`. We detect and move them here.
+    """
+    EMAIL_RE    = re.compile(r"^[\w.\-+]+@[\w.\-]+\.[a-zA-Z]{2,}$")
+    all_emails  = list(mention_emails)
+    plain_names = []
+
+    for m in mentions:
+        if EMAIL_RE.match(m.strip()):
+            if m.strip() not in all_emails:
+                all_emails.append(m.strip())   # ✅ move email to email bucket
+        else:
+            plain_names.append(m)              # keep as display name
+
+    to_list      = []
+    matched_info = []
+
+    for cc_email, mapped_name in cc_author_map.items():
+        matched      = False
+        match_reason = ""
+
+        # Strategy 1: display name substring match
+        for mention in plain_names:
+            m = mention.lower().strip()
+            n = mapped_name.lower().strip()
+            if not m or not n:
+                continue
+            if m in n or n in m:
+                matched      = True
+                match_reason = f"@{mention} (name match) → {cc_email}"
+                break
+
+        # Strategy 2: exact email match
+        # keerthan.kumar-k@hp.com == keerthan.kumar-k@hp.com ✅
+        if not matched:
+            for memail in all_emails:
+                if memail.lower().strip() == cc_email.lower().strip():
+                    matched      = True
+                    match_reason = f"@{memail} (exact email) → {cc_email}"
+                    break
+
+        # Strategy 3: username token fuzzy match
+        if not matched:
+            name_tokens = set(re.split(r"[\s._\-]+", mapped_name.lower()))
+            name_tokens.discard("")
+            for memail in all_emails:
+                username       = memail.split("@")[0].lower()
+                username_parts = set(re.split(r"[\s._\-]+", username))
+                username_parts.discard("")
+                overlap        = name_tokens & username_parts
+
+                if len(overlap) >= 2:
+                    matched      = True
+                    match_reason = f"@{memail} (tokens {overlap} ~ '{mapped_name}') → {cc_email}"
+                    break
+                elif len(overlap) == 1 and any(len(t) > 5 for t in overlap):
+                    matched      = True
+                    match_reason = f"@{memail} (strong token '{list(overlap)[0]}') → {cc_email}"
+                    break
+                else:
+                    normalised = re.sub(r"[\.\-_]", " ", username)
+                    if normalised in mapped_name.lower():
+                        matched      = True
+                        match_reason = f"@{memail} ('{normalised}' in '{mapped_name}') → {cc_email}"
+                        break
+
+        if matched and cc_email not in to_list:
+            to_list.append(cc_email)
+            matched_info.append(match_reason)
+
+    return to_list, matched_info
+
 
 # ----------------------------------
 # 🔹 SENDGRID EMAIL NOTIFICATION
 # ----------------------------------
 def send_via_sendgrid(to_list, bug_id, comment_txt, author, comment_date):
-    """Send branded notification via SendGrid API — no SMTP needed."""
+    """Send branded @mention notification via SendGrid API."""
     if not to_list:
         return False, "No recipients"
 
@@ -347,7 +486,7 @@ def send_via_sendgrid(to_list, bug_id, comment_txt, author, comment_date):
     <html><body style="font-family:Arial,sans-serif;background:#f4f4f4;padding:20px;">
     <div style="max-width:600px;margin:auto;background:white;border-radius:10px;overflow:hidden;">
         <div style="background:#1F2A40;padding:20px;">
-            <h2 style="color:white;margin:0;">🚀 QATrackPro — New Comment Alert</h2>
+            <h2 style="color:white;margin:0;">🚀 QATrackPro — You were @mentioned!</h2>
         </div>
         <div style="padding:24px;">
             <table style="width:100%;border-collapse:collapse;">
@@ -385,11 +524,9 @@ def send_via_sendgrid(to_list, bug_id, comment_txt, author, comment_date):
     """
 
     payload = {
-        "personalizations": [{
-            "to": [{"email": e} for e in to_list],
-        }],
+        "personalizations": [{"to": [{"email": e} for e in to_list]}],
         "from":    {"email": st.secrets["sendgrid_sender"], "name": "QATrackPro"},
-        "subject": f"[QATrackPro] New comment on {bug_id}",
+        "subject": f"[QATrackPro] You were @mentioned on {bug_id}",
         "content": [{"type": "text/html", "value": html}]
     }
 
@@ -408,6 +545,7 @@ def send_via_sendgrid(to_list, bug_id, comment_txt, author, comment_date):
         return False, f"SendGrid {res.status_code}: {res.text[:100]}"
     except Exception as e:
         return False, str(e)
+
 
 # ----------------------------------
 # 🔹 RESOLVE PLAN IDs → RUN IDs
@@ -439,13 +577,11 @@ if plan_info:
             unsafe_allow_html=True
         )
 
-# ── Reset checkbox keys only when input changes ──
 if st.session_state.get("last_input") != run_input:
     st.session_state.last_input = run_input
     for rid in all_run_ids:
-        st.session_state[f"chk_{rid}"] = True  # default all selected
+        st.session_state[f"chk_{rid}"] = True
 
-# ── Count selected from chk_ keys ──
 selected_count = sum(1 for rid in all_run_ids if st.session_state.get(f"chk_{rid}", True))
 
 with st.expander(f"▶ Select Runs — {selected_count} of {len(all_run_ids)} selected", expanded=False):
@@ -470,7 +606,6 @@ with st.expander(f"▶ Select Runs — {selected_count} of {len(all_run_ids)} se
                 run_name = run_name_map.get(rid, f"Run {rid}")
                 st.checkbox(f"**{rid}**  \n{run_name}", key=f"chk_{rid}")
 
-# ── Derive run_ids purely from chk_ keys ──
 run_ids = [rid for rid in all_run_ids if st.session_state.get(f"chk_{rid}", True)]
 
 if not run_ids:
@@ -558,7 +693,7 @@ cards = [
     ("👨‍💻", "Tester Performance", "perf"),
     ("🚨", "Failed Tests",       "failed"),
     ("💬", "Jira Activity",      "jira"),
-    ("📊", "Internal NPPM",      "npm"),
+    ("📊", "Internal MPPM",      "npm"),
 ]
 
 nav1, nav2, nav3, nav4, nav5 = st.columns(5)
@@ -743,7 +878,7 @@ elif st.session_state.active_section == "failed":
             st.plotly_chart(fig_fr, use_container_width=True)
 
 # ----------------------------------
-# 💬 JIRA ACTIVITY + SENDGRID NOTIFICATIONS
+# 💬 JIRA ACTIVITY + @MENTION NOTIFICATIONS
 # ----------------------------------
 elif st.session_state.active_section == "jira":
     st.markdown('<div class="section-header">💬 Jira Activity</div>', unsafe_allow_html=True)
@@ -753,7 +888,9 @@ elif st.session_state.active_section == "jira":
     else:
         jira_df["Project"] = jira_df["BugID"].str.extract(r"^([A-Z]+)-\d+")
         jira_projects      = sorted(jira_df["Project"].dropna().unique().tolist())
-        selected_jira_project = st.selectbox("🔍 Filter by Project", options=["All"] + jira_projects, key="jira_project_filter")
+        selected_jira_project = st.selectbox(
+            "🔍 Filter by Project", options=["All"] + jira_projects, key="jira_project_filter"
+        )
 
         filtered_jira = (
             jira_df if selected_jira_project == "All"
@@ -769,98 +906,168 @@ elif st.session_state.active_section == "jira":
         st.dataframe(filtered_jira[existing], use_container_width=True)
 
         # ======================================================
-        # 🔔 AUTO COMMENT NOTIFICATION via SendGrid
+        # 🔔 @MENTION NOTIFICATIONS via SendGrid
         # ======================================================
         st.markdown("---")
-        st.markdown("### 🔔 Auto Comment Notifications")
-        st.caption("Whenever a new comment is detected on a linked bug (checks every 5 min), an email is sent via SendGrid to everyone in your list.")
-
+        st.markdown("### 🔔 @Mention Notifications")
+        st.caption(
+            "When someone adds a Jira comment that **@mentions** a person in your CC list, "
+            "an email is sent **only to that mentioned person**. Checks every 5 min automatically."
+        )
+ 
         # ── init session state ────────────────────────────────
         if "seen_comment_ids" not in st.session_state:
             st.session_state.seen_comment_ids = {}
-        if "cc_list" not in st.session_state:
-            st.session_state.cc_list = load_cc()
+        if "cc_author_map" not in st.session_state:
+            st.session_state.cc_author_map = load_cc()
         if "notif_log" not in st.session_state:
             st.session_state.notif_log = []
-
-        # ── email list input ──────────────────────────────────
-        notif_col1, notif_col2 = st.columns([3, 1])
-        with notif_col1:
-            cc_input = st.text_input(
-                "📧 Notify these emails (comma separated)",
-                value=", ".join(st.session_state.cc_list),
-                placeholder="e.g. alice@hp.com, bob@hp.com",
-                key="cc_input"
+ 
+        # ── CC list UI ────────────────────────────────────────
+        st.markdown("#### 👥 CC List — Email → Jira Display Name")
+        st.caption(
+            "Enter each person's **email** and their **exact Jira display name** "
+            "(as it appears when you @mention them in a Jira comment)."
+        )
+ 
+        map_col1, map_col2, map_col3 = st.columns([3, 3, 1])
+        with map_col1:
+            new_email = st.text_input(
+                "📧 Email", placeholder="keerthan.kumar-k@hp.com", key="new_map_email"
             )
-        with notif_col2:
+        with map_col2:
+            new_author = st.text_input(
+                "👤 Jira Display Name (exact)", placeholder="Keerthan Kumar K", key="new_map_author"
+            )
+        with map_col3:
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("💾 Save", use_container_width=True):
-                st.session_state.cc_list = [
-                    e.strip() for e in cc_input.split(",")
-                    if e.strip() and "@" in e
-                ]
-                save_cc(st.session_state.cc_list)
-                st.success(f"Saved {len(st.session_state.cc_list)} emails ✅")
-
-        if st.session_state.cc_list:
-            st.markdown(
-                " ".join([f'<span class="notif-badge">{e}</span>' for e in st.session_state.cc_list]),
-                unsafe_allow_html=True
-            )
-
-        # ── enable/disable toggle ─────────────────────────────
+            if st.button("➕ Add", use_container_width=True, key="add_cc_btn"):
+                if new_email and "@" in new_email and new_author.strip():
+                    st.session_state.cc_author_map[new_email.strip()] = new_author.strip()
+                    save_cc(st.session_state.cc_author_map)
+                    st.success(f"Added: {new_email.strip()} → {new_author.strip()} ✅")
+                    st.rerun()
+                else:
+                    st.warning("Please enter a valid email and display name.")
+ 
+        if st.session_state.cc_author_map:
+            st.markdown("**Current CC List:**")
+            for em, au in list(st.session_state.cc_author_map.items()):
+                rc1, rc2 = st.columns([8, 1])
+                with rc1:
+                    st.markdown(
+                        f'<span class="notif-badge">📧 {em}</span>'
+                        f'&nbsp;→&nbsp;<span style="color:#BDC3C7;font-size:13px;">@{au}</span>',
+                        unsafe_allow_html=True
+                    )
+                with rc2:
+                    if st.button("🗑️", key=f"del_{em}"):
+                        del st.session_state.cc_author_map[em]
+                        save_cc(st.session_state.cc_author_map)
+                        st.rerun()
+            st.markdown("<br>", unsafe_allow_html=True)
+        else:
+            st.info("No CC entries yet — add emails above.")
+ 
+        # ── toggle ───────────────────────────────────────────
         auto_on = st.toggle(
-            "🔄 Auto-notify enabled",
+            "🔄 Auto-notify on @mentions (checks every 5 min)",
             value=st.session_state.get("auto_notify_on", False),
             key="auto_notify_toggle"
         )
         st.session_state.auto_notify_on = auto_on
-
-        # ── AUTO CHECK + SEND on every page load ─────────────
+ 
+        # ── AUTO CHECK + SEND ─────────────────────────────────
         if auto_on and linked_bugs:
-            newly_notified = []
+            if not st.session_state.cc_author_map:
+                st.warning("⚠️ Add at least one email to the CC list above.")
+            else:
+                newly_notified = []
+ 
+                for bug_id in linked_bugs:
+                    try:
+                        latest = get_single_comment(bug_id)
+                        if not latest:
+                            continue
+ 
+                        current_id = latest.get("CommentID", "")
+                        last_seen  = st.session_state.seen_comment_ids.get(bug_id, "")
+ 
+                        if not current_id or current_id == last_seen:
+                            continue
+ 
+                        # Mark seen immediately
+                        st.session_state.seen_comment_ids[bug_id] = current_id
+ 
+                        author         = latest.get("Author", "")
+                        mentions       = latest.get("Mentions", [])
+                        mention_emails = latest.get("MentionEmails", [])
+ 
+                        all_mentions_display = (
+                            [f"@{m}" for m in mentions] +
+                            [f"@{e}" for e in mention_emails]
+                        )
+ 
+                        if not mentions and not mention_emails:
+                            st.session_state.notif_log.append({
+                                "time":           datetime.now().strftime("%d %b %Y %H:%M"),
+                                "bug":            bug_id,
+                                "comment_author": author,
+                                "mentioned":      "— (no @mentions)",
+                                "matched":        "—",
+                                "sent_to":        0,
+                                "emails":         "—",
+                                "status":         "⚠️ No @mentions in comment",
+                            })
+                            continue
+ 
+                        to_list, matched_info = resolve_mention_to_emails(
+                            mentions, mention_emails, st.session_state.cc_author_map
+                        )
 
-            for bug_id in linked_bugs:
-                try:
-                    latest     = get_single_comment(bug_id)
-                    if not latest:
-                        continue
-                    current_id = latest.get("CommentID", "")
-                    last_seen  = st.session_state.seen_comment_ids.get(bug_id, "")
-
-                    if current_id and current_id != last_seen:
-                        to_list = st.session_state.cc_list
                         if to_list:
                             ok, msg = send_via_sendgrid(
                                 to_list,
                                 bug_id,
                                 latest.get("LatestComment", ""),
-                                latest.get("Author", ""),
+                                author,
                                 latest.get("CommentDateDisp", ""),
                             )
-                            st.session_state.seen_comment_ids[bug_id] = current_id
                             st.session_state.notif_log.append({
-                                "time":    datetime.now().strftime("%d %b %Y %H:%M"),
-                                "bug":     bug_id,
-                                "author":  latest.get("Author", ""),
-                                "sent_to": len(to_list),
-                                "status":  "✅ Sent" if ok else f"❌ {msg[:50]}"
+                                "time":           datetime.now().strftime("%d %b %Y %H:%M"),
+                                "bug":            bug_id,
+                                "comment_author": author,
+                                "mentioned":      ", ".join(all_mentions_display),
+                                "matched":        " | ".join(matched_info),
+                                "sent_to":        len(to_list),
+                                "emails":         ", ".join(to_list),
+                                "status":         "✅ Sent" if ok else f"❌ {msg[:60]}",
                             })
                             newly_notified.append(bug_id)
                         else:
-                            st.session_state.seen_comment_ids[bug_id] = current_id
-                except:
-                    continue
-
-            if newly_notified:
-                st.success(f"🔔 Notifications sent for: {', '.join(newly_notified)}")
-            else:
-                st.caption(f"✅ No new comments — last checked {datetime.now().strftime('%H:%M')}")
-
+                            st.session_state.notif_log.append({
+                                "time":           datetime.now().strftime("%d %b %Y %H:%M"),
+                                "bug":            bug_id,
+                                "comment_author": author,
+                                "mentioned":      ", ".join(all_mentions_display),
+                                "matched":        "—",
+                                "sent_to":        0,
+                                "emails":         "—",
+                                "status":         "⚠️ @mentioned person not in CC list",
+                            })
+ 
+                    except:
+                        continue
+ 
+                if newly_notified:
+                    st.success(f"🔔 Notifications sent for: {', '.join(newly_notified)}")
+                else:
+                    st.caption(f"✅ Checked for @mentions — last checked {datetime.now().strftime('%H:%M')}")
+ 
         elif auto_on and not linked_bugs:
             st.info("No linked bugs found in current runs.")
-
-        # ── notification log ──────────────────────────────────
+ 
+        # ── Notification log ──────────────────────────────────
         if st.session_state.notif_log:
             st.markdown("#### 📋 Notification Log")
             log_df = pd.DataFrame(st.session_state.notif_log[::-1])
@@ -868,12 +1075,13 @@ elif st.session_state.active_section == "jira":
             if st.button("🗑️ Clear Log"):
                 st.session_state.notif_log = []
                 st.rerun()
+ 
 
 # ----------------------------------
 # 📊 NPM — PROJECT METRICS EXPORT
 # ----------------------------------
 elif st.session_state.active_section == "npm":
-    st.markdown('<div class="section-header">📊 Internal NPPM — Project Metrics Export</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">📊 Internal MPPM — Project Metrics Export</div>', unsafe_allow_html=True)
 
     @st.cache_data(ttl=600)
     def get_run_case_count(run_id):
@@ -889,7 +1097,7 @@ elif st.session_state.active_section == "npm":
             )
             if res.status_code != 200:
                 return 0
-            data = res.json()
+            data  = res.json()
             tests = data.get("tests", data) if isinstance(data, dict) else data
             return len(tests)
         except:
@@ -904,7 +1112,7 @@ elif st.session_state.active_section == "npm":
         .str.split(",").explode().str.strip().dropna()
         .unique().tolist()
     )
-    total_defects = len(linked_defect_ids)
+    total_defects   = len(linked_defect_ids)
     total_testcases = total_manual
 
     st.caption("Columns marked **auto** are filled from TestRail / Jira. Fill the rest after exporting.")
@@ -944,10 +1152,10 @@ elif st.session_state.active_section == "npm":
             )
             np_adhoc = st.number_input("Adhoc", min_value=0, value=0, key="np_adhoc")
         with fc2:
-            np_res = st.number_input("Number of Resources Utilized", min_value=0, value=0, key="np_res")
+            np_res  = st.number_input("Number of Resources Utilized", min_value=0, value=0, key="np_res")
             np_days = st.number_input("No. of Working Days", min_value=0, value=0, key="np_days")
         with fc3:
-            np_comments = st.text_area("Comments", key="np_comments", height=80)
+            np_comments    = st.text_area("Comments", key="np_comments", height=80)
             computed_total = np_reg_etc + np_adhoc
             st.markdown(f"**Manual Testcases (auto):** `{total_manual}`")
             st.markdown(f"**Total Defects (auto):** `{total_defects}`")
@@ -991,14 +1199,14 @@ elif st.session_state.active_section == "npm":
             ws = wb.active
             ws.title = "NPM Metrics"
 
-            headers = list(rows[0].keys())
+            headers     = list(rows[0].keys())
             header_fill = PatternFill("solid", fgColor="1F2A40")
             header_font = Font(bold=True, color="FFFFFF", size=11)
 
             for ci, h in enumerate(headers, 1):
-                cell = ws.cell(row=1, column=ci, value=h)
-                cell.font = header_font
-                cell.fill = header_fill
+                cell           = ws.cell(row=1, column=ci, value=h)
+                cell.font      = header_font
+                cell.fill      = header_fill
                 cell.alignment = Alignment(horizontal="center", wrap_text=True)
 
             auto_cols = {
@@ -1011,8 +1219,8 @@ elif st.session_state.active_section == "npm":
 
             for ri, row in enumerate(rows, 2):
                 for ci, h in enumerate(headers, 1):
-                    val = row[h]
-                    cell = ws.cell(row=ri, column=ci, value=val if val != "" else None)
+                    val            = row[h]
+                    cell           = ws.cell(row=ri, column=ci, value=val if val != "" else None)
                     cell.alignment = Alignment(horizontal="center")
                     if h in auto_cols:
                         cell.fill = auto_fill
@@ -1033,9 +1241,9 @@ elif st.session_state.active_section == "npm":
 
         excel_buf = build_npm_excel(st.session_state.npm_rows)
         st.download_button(
-            label="📥 Download NPPM Excel",
+            label="📥 Download MPPM Excel",
             data=excel_buf,
-            file_name="NPPM_Project_Metrics.xlsx",
+            file_name="MPPM_Project_Metrics.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=False,
